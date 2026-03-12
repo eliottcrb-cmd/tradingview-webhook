@@ -1,112 +1,197 @@
+import os
+import time
+import hmac
+import hashlib
+import json
+import logging
+
+import requests
 from flask import Flask, request, jsonify
 
+# -------------------------------------------------
+# Basic Flask app
+# -------------------------------------------------
 app = Flask(__name__)
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# -------------------------------------------------
+# Environment configuration
+# -------------------------------------------------
+# Set these in Render dashboard → Environment
+COINBASE_API_KEY = os.getenv("COINBASE_API_KEY")
+COINBASE_API_SECRET = os.getenv("COINBASE_API_SECRET")
+COINBASE_API_PASSPHRASE = os.getenv("COINBASE_API_PASSPHRASE")
+
+# Sandbox by default. If you ever go live, change this carefully.
+COINBASE_BASE_URL = os.getenv(
+    "COINBASE_BASE_URL",
+    "https://api-public.sandbox.exchange.coinbase.com"
+)
+
+if not COINBASE_API_KEY or not COINBASE_API_SECRET or not COINBASE_API_PASSPHRASE:
+    logging.warning("Coinbase API credentials are not fully set in environment variables.")
+
+
+# -------------------------------------------------
+# Coinbase Advanced signing helper
+# -------------------------------------------------
+def sign_request(timestamp: str, method: str, request_path: str, body: str) -> str:
+    """
+    Create CB-ACCESS-SIGN header value.
+    """
+    message = f"{timestamp}{method.upper()}{request_path}{body}".encode("utf-8")
+    secret = COINBASE_API_SECRET.encode("utf-8")
+    signature = hmac.new(secret, message, hashlib.sha256).digest()
+    return signature.hex()
+
+
+def coinbase_headers(method: str, request_path: str, body: dict) -> dict:
+    timestamp = str(int(time.time()))
+    body_str = json.dumps(body) if body else ""
+    signature = sign_request(timestamp, method, request_path, body_str)
+
+    return {
+        "CB-ACCESS-KEY": COINBASE_API_KEY,
+        "CB-ACCESS-SIGN": signature,
+        "CB-ACCESS-TIMESTAMP": timestamp,
+        "CB-ACCESS-PASSPHRASE": COINBASE_API_PASSPHRASE,
+        "Content-Type": "application/json"
+    }
+
+
+# -------------------------------------------------
+# Order creation on Coinbase Advanced
+# -------------------------------------------------
+def place_coinbase_order(symbol: str, side: str, qty: str, order_type: str = "market"):
+    """
+    Place an order on Coinbase Advanced.
+    symbol: e.g. 'SOL-USD'
+    side: 'buy' or 'sell'
+    qty: string quantity, e.g. '1.5'
+    order_type: 'market' or 'limit'
+    """
+    request_path = "/api/v3/brokerage/orders"
+    url = COINBASE_BASE_URL + request_path
+
+    # Basic market order payload
+    body = {
+        "product_id": symbol,          # e.g. 'SOL-USD'
+        "side": side.lower(),          # 'buy' or 'sell'
+        "order_configuration": {
+            "market_market_ioc": {
+                "base_size": qty       # quantity in base asset (e.g. SOL)
+            }
+        }
+    }
+
+    headers = coinbase_headers("POST", request_path, body)
+
+    logging.info(f"Placing Coinbase order: {body}")
+    response = requests.post(url, headers=headers, json=body, timeout=10)
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw_text": response.text}
+
+    logging.info(f"Coinbase response status: {response.status_code}")
+    logging.info(f"Coinbase response body: {data}")
+
+    return response.status_code, data
+
+
+# -------------------------------------------------
+# Webhook endpoint for TradingView
+# -------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(force=True, silent=True) or {}
+    """
+    TradingView → Render → Coinbase Advanced
+    Expected JSON payload example (SOL):
 
-if data.get("type") == "heartbeat":
-    return jsonify({"status": "alive"}), 200
+    {
+      "symbol": "SOL-USD",
+      "side": "buy",
+      "qty": "1.0",
+      "type": "market"
+    }
+    """
+    try:
+        data = request.get_json(force=True, silent=False)
+    except Exception as e:
+        logging.error(f"Failed to parse JSON: {e}")
+        return jsonify({"error": "Invalid JSON"}), 400
 
-required_fields = ["symbol", "side", "entry", "stop", "take_profit", "risk_percent"]
-missing = [f for f in required_fields if f not in data]
-if missing:
-    return jsonify({
-        "status": "error",
-        "error": "missing_fields",
-        "details": missing
-    }), 400
+    logging.info(f"Incoming webhook payload: {data}")
 
-symbol = data["symbol"]
-side = data["side"].lower()
-entry = float(data["entry"])
-stop = float(data["stop"])
-take_profit = float(data["take_profit"])
-risk_percent = float(data["risk_percent"])
+    # Validate required fields
+    required_fields = ["symbol", "side", "qty"]
+    missing = [f for f in required_fields if f not in data]
 
-if side not in ["buy", "sell"]:
-    return jsonify({"status": "error", "error": "invalid_side"}), 400
-
-if entry == stop:
-    return jsonify({"status": "error", "error": "entry_equals_stop"}), 400
-
-account_balance = 10000.0
-risk_amount = account_balance * (risk_percent / 100.0)
-stop_distance = abs(entry - stop)
-
-if stop_distance <= 0:
-    return jsonify({"status": "error", "error": "invalid_stop_distance"}), 400
-
-position_size = risk_amount / stop_distance
-
-print("=== INCOMING TRADE SIGNAL ===")
-print({
-    "symbol": symbol,
-    "side": side,
-    "entry": entry,
-    "stop": stop,
-    "take_profit": take_profit,
-    "risk_percent": risk_percent,
-    "account_balance": account_balance,
-    "risk_amount": risk_amount,
-    "stop_distance": stop_distance,
-    "position_size": position_size
-})
-print("=== END SIGNAL ===")
-
-return jsonify({
-    "status": "ok",
-    "mode": "dry_run",
-    "symbol": symbol,
-    "side": side,
-    "position_size": position_size
-}), 200
+    if missing:
+        msg = f"Missing required fields: {missing}"
+        logging.error(msg)
+        return jsonify({"error": msg}), 400
 
     symbol = data["symbol"]
-    side = data["side"].lower()
-    entry = float(data["entry"])
-    stop = float(data["stop"])
-    take_profit = float(data["take_profit"])
-    risk_percent = float(data["risk_percent"])
+    side = data["side"]
+    qty = data["qty"]
+    order_type = data.get("type", "market")
 
-    if side not in ["buy", "sell"]:
-        return jsonify({"status": "error", "error": "invalid_side"}), 400
+    # Basic sanity checks
+    if side.lower() not in ["buy", "sell"]:
+        msg = f"Invalid side: {side}"
+        logging.error(msg)
+        return jsonify({"error": msg}), 400
 
-    if entry == stop:
-        return jsonify({"status": "error", "error": "entry_equals_stop"}), 400
+    try:
+        float(qty)
+    except ValueError:
+        msg = f"Invalid qty (not a number): {qty}"
+        logging.error(msg)
+        return jsonify({"error": msg}), 400
 
-    account_balance = 10000.0
-    risk_amount = account_balance * (risk_percent / 100.0)
-    stop_distance = abs(entry - stop)
+    logging.info(
+        f"Parsed order → symbol={symbol}, side={side}, qty={qty}, type={order_type}"
+    )
 
-    if stop_distance <= 0:
-        return jsonify({"status": "error", "error": "invalid_stop_distance"}), 400
+    # Place order on Coinbase
+    status_code, cb_response = place_coinbase_order(
+        symbol=symbol,
+        side=side,
+        qty=str(qty),
+        order_type=order_type
+    )
 
-    position_size = risk_amount / stop_distance
+    if 200 <= status_code < 300:
+        return jsonify({
+            "status": "ok",
+            "coinbase_status": status_code,
+            "coinbase_response": cb_response
+        }), 200
+    else:
+        return jsonify({
+            "status": "error",
+            "coinbase_status": status_code,
+            "coinbase_response": cb_response
+        }), 502
 
-    print("=== INCOMING TRADE SIGNAL ===")
-    print({
-        "symbol": symbol,
-        "side": side,
-        "entry": entry,
-        "stop": stop,
-        "take_profit": take_profit,
-        "risk_percent": risk_percent,
-        "account_balance": account_balance,
-        "risk_amount": risk_amount,
-        "stop_distance": stop_distance,
-        "position_size": position_size
-    })
-    print("=== END SIGNAL ===")
 
-    return jsonify({
-        "status": "ok",
-        "mode": "dry_run",
-        "symbol": symbol,
-        "side": side,
-        "position_size": position_size
-    }), 200
+# -------------------------------------------------
+# Health check
+# -------------------------------------------------
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "alive", "message": "SOL webhook online"}), 200
 
+
+# -------------------------------------------------
+# Local run (Render will use: python app.py)
+# -------------------------------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
